@@ -70,7 +70,16 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._quoting import norm, source_doc
 from harness.middleware import Middleware
+
+#: Chỗ mô hình dán hai nửa của hai tài liệu lại — xem GỢI Ý ở trên.
+FUSE_JOINERS = (" và ", " còn ", " nhưng ", " trong khi ")
+
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ để trả lời: các tài liệu đã đọc không chứa thông tin "
+    "cần thiết, nên báo cáo này không đưa ra kết luận nào."
+)
 
 
 class Critic(Middleware):
@@ -79,16 +88,77 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        kept, dropped, split = [], 0, 0
+        seen: set = set()
+        for claim in claims:
+            if not isinstance(claim, dict):
+                dropped += 1
+                continue
+            text = claim.get("text")
+            # Cùng một câu nộp hai lần dưới hai doc_id chỉ tốn precision:
+            # bản thứ hai bị chấm IRRELEVANT/REDUNDANT mà không thêm được
+            # recall nào (câu vẫn còn nguyên ở bản đầu). Xoá là hợp lệ.
+            key = norm(text) if isinstance(text, str) else None
+            if key and key in seen:
+                dropped += 1
+                continue
+            if key:
+                seen.add(key)
+            if isinstance(text, str) and ctx.saw(text):
+                kept.append(claim)  # bằng chứng đỡ được: KHÔNG sửa chữ
+                continue
+            halves = _unfuse(ctx, text)
+            if halves:
+                # Câu ghép: hai nửa đều là chữ của mô hình, mỗi nửa về
+                # đúng tài liệu của nó. Hai nguồn mâu thuẫn -> abstain.
+                kept.extend(halves)
+                report["abstain"] = True
+                split += 1
+            else:
+                dropped += 1  # bịa
+        ctx.state["critic_dropped"] = dropped
+        ctx.state["critic_unfused"] = split
+        if not kept:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+            return report
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
+
+
+def _unfuse(ctx, text):
+    """Tách một câu ghép thành hai nửa CÓ THẬT, hoặc trả về None.
+
+    Cắt đúng chỗ dán thì mỗi nửa vẫn là substring của chữ mô hình đã
+    viết (giữ provenance) và nằm gọn trong một tài liệu ĐÃ ĐỌC. Cắt sai
+    thì ít nhất một nửa vắt qua hai tài liệu và không quan sát nào chứa
+    nó — đúng lúc đó hàm này trả None và claim bị xoá.
+    """
+    if not isinstance(text, str):
+        return None
+    observed = ctx.observed_text
+    for joiner in FUSE_JOINERS:
+        start = text.find(joiner)
+        while start != -1:
+            left, right = text[:start].strip(), text[start + len(joiner):].strip()
+            left_doc = source_doc(ctx.corpus, observed, left)
+            right_doc = source_doc(ctx.corpus, observed, right)
+            if (
+                left_doc is not None
+                and right_doc is not None
+                and left_doc.doc_id != right_doc.doc_id
+                and ctx.saw(left)
+                and ctx.saw(right)
+            ):
+                return [
+                    {"text": left, "doc_id": left_doc.doc_id},
+                    {"text": right, "doc_id": right_doc.doc_id},
+                ]
+            start = text.find(joiner, start + 1)
+    return None
