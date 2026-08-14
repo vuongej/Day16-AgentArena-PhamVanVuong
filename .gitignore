@@ -18,5 +18,10 @@ runs/
 # committed if it ever lands here: it is how the scored round stays scored.
 phases/private/
 
+# Khoá API của đường chạy thật. `.env.example` là mẫu rỗng, commit được;
+# `.env` chứa ARENA_API_KEY thật và KHÔNG BAO GIỜ được commit.
+.env
+.env.local
+
 # macOS
 .DS_Store

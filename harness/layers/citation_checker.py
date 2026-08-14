@@ -62,11 +62,57 @@ from __future__ import annotations
 from harness.layers._quoting import quotes_a_line, source_doc
 from harness.middleware import Middleware
 
+#: Siết lại quy tắc 1 của `ARENA_SYSTEM_PROMPT` cho model THẬT.
+#:
+#: Prompt đóng băng chỉ nói "một câu TRÍCH NGUYÊN VĂN". Đo trên
+#: gpt-5.6-luna: nó trích ĐÚNG nhưng CẮT CỤT — claim vẫn được chấm
+#: SUPPORTED, doc_id vẫn đúng, precision vẫn 1.0, nhưng đoạn nó chép
+#: không phủ hết key_terms của required_fact nên recall = 0. Đó là 5/9
+#: brief có G 0.00 ở đường thật.
+#:
+#: Chữa sau khi model đã viết là KHÔNG THỂ: kéo dài `claim["text"]` là
+#: sửa chữ, mất provenance ngay. Nên chỗ duy nhất sửa được là TRƯỚC khi
+#: model viết.
+#:
+#: CHỈ nối vào message `system`. `arena.model._first_user_content` lấy
+#: message USER cuối cùng trước lượt assistant đầu tiên làm câu hỏi của
+#: brief, nên chèn vào user là biến chính lời nhắc thành truy vấn tìm
+#: kiếm cho cả lượt chạy — không một dòng lỗi nào báo.
+QUOTE_RULE = """
+
+QUY TẮC TRÍCH DẪN (bổ sung, bắt buộc):
+1a. Mỗi "text" trong "claims" phải sao chép TRỌN VẸN MỘT DÒNG của tài liệu — từ đầu
+    dòng đến hết dòng đó. KHÔNG cắt ngắn, KHÔNG dừng giữa câu, KHÔNG thay phần còn
+    lại bằng "...".
+1b. Chép đúng từng ký tự: giữ nguyên dấu câu, chữ hoa, dấu nháy và khoảng trắng.
+    Chỉ cần thêm một dấu chấm là claim đó mất giá trị hoàn toàn.
+1c. KHÔNG ghép nội dung của hai dòng khác nhau, hoặc của hai tài liệu khác nhau,
+    vào cùng một "text".
+1d. Ưu tiên chọn dòng nào trả lời TRỰC TIẾP câu hỏi của brief, và chép trọn dòng ấy.
+
+ĐÃ THỬ VÀ ĐÃ BỎ — đừng thêm lại: một khối "quy tắc truy xuất" (tìm lại bằng từ khoá
+khác, bỏ qua chi tiết bối cảnh trong câu hỏi) đo được 63.20 trên 3 lượt real so với
+63.93 khi không có nó, và kéo mock từ 81.71 xuống 81.44. Nút thắt của pub-08/09 là
+tài liệu bắt buộc không nằm trong top-10 BM25 của chính câu hỏi — prompt không chữa
+được, và bảng đồng nghĩa chữa được thì chính là hard-code bộ công khai."""
+
 
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
+
+    def before_model(self, ctx, messages):
+        out, patched = [], False
+        for message in messages:
+            if not patched and message.get("role") == "system":
+                out.append({**message, "content": message.get("content", "") + QUOTE_RULE})
+                patched = True
+            else:
+                out.append(message)
+        # Không có message `system` (endpoint bỏ system): để nguyên. Nối
+        # vào user ở đây đắt hơn nhiều so với việc bỏ qua lời nhắc.
+        return out if patched else messages
 
     def after_agent(self, ctx, report):
         claims = report.get("claims")
